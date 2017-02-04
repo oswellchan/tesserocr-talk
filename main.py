@@ -3,7 +3,10 @@ from tesserocr import PyTessBaseAPI, RIL, PSM, Orientation
 import time
 import copy
 import numpy as np
-
+import cv2
+import math
+import scipy.ndimage
+import matplotlib.pyplot as plt
 
 THRESHOLD_WHITE = 200
 WEIGHT = 5
@@ -193,39 +196,146 @@ def get_weight(x, y, w, h, radius, pix):
 
     return result
 
+def unit_vector(vector):
+    if np.linalg.norm(vector) == 0:
+        return None
+    return vector / np.linalg.norm(vector)
 
-img_path = './test/cropped/test16.jpg'
-image = Image.open(img_path)
+def calc_angle(line):
+    x1, y1, x2, y2 = line
+    v1 = unit_vector(np.array([x1 - x2, y1 - y2]))
+    v2 = np.array([0, 1])
+    if v1 is None:
+        return 0
+    return np.arccos(np.clip(np.dot(v1, v2), -1.0, 1.0))/np.pi * 180
 
-# with PyTessBaseAPI() as api:
-#     image = rotate_to_upright(image, api)
-#     api.SetImage(image)
-#     binarised = api.GetThresholdedImage()
-#     matrix = get_weighted_img(binarised, 1)
+def find_best_angle(image):
+    best_angle = 0
+    max_variance = 0
+    fig_num = 0
+    count = 0
+    for angle in np.linspace(-2.0, 2.0, num=32):
+        fig_num += 1
+        plt.subplot(2, 3, fig_num)
+        rotated = scipy.ndimage.rotate(image, angle)
+        variance = np.var(np.sum(rotated, axis=1))
+        plt.imshow(rotated)
+        plt.title(variance)
+        if fig_num == 6:
+            fig_num = 0
+            count += 1
+            plt.savefig('all_angles{}.jpg'.format(count))
 
-with PyTessBaseAPI() as api:
-    image = rotate_to_upright(image, api)
+        if variance > max_variance:
+            best_angle = angle
+            max_variance = variance
 
-with PyTessBaseAPI(psm=PSM.SINGLE_BLOCK) as api:
-    api.SetImage(image)
-    width, height = image.size
-    names_coord, prices_coord = split_image(api.GetThresholdedImage())
-    names_img = image.crop((names_coord[0], 0, names_coord[1], height - 1))
-    prices_img = image.crop((prices_coord[0], 0, prices_coord[1], height - 1))
+    return best_angle
 
-    api.SetPageSegMode(PSM.SINGLE_LINE)
-    api.SetImage(names_img)
-    boxes = api.GetComponentImages(RIL.TEXTLINE, True)
+def calculate_variance(image):
+    return 
 
-    for im, box, __, __ in boxes:
-        api.SetRectangle(box['x'], box['y'], box['w'], box['h'])
-        ocrResult = api.GetUTF8Text()
-        conf = api.MeanTextConf()
-        print(ocrResult)
-    
-    draw_boxes(boxes, image)
-               
+if __name__ == '__main__':
+    image = None
+    img_name = './test/cropped/test19'
+    try:
+        img_path = img_name + '.JPG'
+        image = Image.open(img_path)
+    except Exception:
+        img_path = img_name + '.jpg'
+        image = Image.open(img_path)
 
+    with PyTessBaseAPI() as api:
+        image = rotate_to_upright(image, api)
 
+    with PyTessBaseAPI(psm=PSM.SINGLE_BLOCK, lang='eng') as api:
+        api.SetImage(image)
+        width, height = image.size
+        binarised = np.array(api.GetThresholdedImage())
+        binarised = cv2.bitwise_not(binarised)
+
+        cropped_height = width // 5
+        all_lines = np.array([[[0, 0, 0, 0]]])
+        start = 0
+        while start < height:
+            end = start + cropped_height
+            if end > height:
+                end = height
+            img_segment = binarised[start:end]
+            lines = cv2.HoughLinesP(
+                img_segment,
+                1,
+                np.pi/180,
+                100,
+                minLineLength=width//3,
+                maxLineGap=width//20
+            )
+
+            if lines is not None:
+                lines += np.array([[0, start, 0, start]])
+                all_lines = np.append(all_lines, lines, axis=0)
+
+            start = end
+
+        # for line in all_lines:
+        #     x1,y1,x2,y2 = line[0]
+        #     cv2.line(binarised,(x1,y1),(x2,y2),(255,0,0),2)
+
+        # cv2.imwrite('lines.jpg', binarised)
+
+        angles_up = []
+        angles_down = []
+        for line in all_lines:
+            angle = calc_angle(line[0])
+            if angle > 180/4 and angle < 90:
+                angles_up.append(angle)
+            if angle >= 90 and angle < 180 * (3/4):
+                angles_down.append(angle)
+
+        rotate_angle = 0
+        if len(angles_up) > 0.8 * len(angles_down):
+            rotate_angle = np.mean(angles_up)
+        elif len(angles_down) > 0.8 * len(angles_up):
+            rotate_angle = np.mean(angles_down)
+        else:
+            rotate_angle = np.mean(
+                np.append(
+                    np.array(angles_up),
+                    np.array(angles_down)
+                )
+            )
+
+        rotate_angle = rotate_angle - 90
+        if math.fabs(rotate_angle) > 2:
+            binarised = scipy.ndimage.rotate(binarised, rotate_angle)
+
+        best_angle = find_best_angle(binarised)
+        binarised = scipy.ndimage.rotate(binarised, best_angle)
+        cv2.imwrite('rotated.jpg', binarised)
+
+        binarised = cv2.bitwise_not(binarised)
+
+        # print(rotate_angle - 90)
+        # image = image.rotate(rotate_angle - 90)
+        # api.SetImage(image)
+
+        # names_coord, prices_coord = split_image(api.GetThresholdedImage())
+        # names_img = image.crop((names_coord[0], 0, names_coord[1], height - 1))
+        # prices_img = image.crop((prices_coord[0], 0, prices_coord[1], height - 1))
+
+        # api.SetPageSegMode(PSM.SINGLE_LINE)
+        # api.SetImage(names_img)
         
+        image = Image.fromarray(binarised)
+        api.SetImage(image)
+        image = api.GetThresholdedImage()
+        image.save('bina.jpg')
+        boxes = api.GetComponentImages(RIL.TEXTLINE, True)
 
+        for im, box, __, __ in boxes:
+            api.SetRectangle(box['x'], box['y'], box['w'], box['h'])
+            ocrResult = api.GetUTF8Text()
+            conf = api.MeanTextConf()
+            print(ocrResult)
+        
+        draw_boxes(boxes, image, color=0)
