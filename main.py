@@ -232,12 +232,83 @@ def find_best_angle(image):
 
     return best_angle
 
-def calculate_variance(image):
-    return 
+def deskew_image(image):
+    height, width = image.shape
+    cropped_height = width // 5
+
+    angles_up = []
+    angles_down = []
+    start = 0
+    while start < height:
+        end = start + cropped_height
+        if end > height:
+            end = height
+        img_segment = image[start:end]
+        lines = cv2.HoughLinesP(
+            img_segment,
+            1,
+            np.pi/180,
+            100,
+            minLineLength=width//3,
+            maxLineGap=width//30
+        )
+        start = end
+
+        if lines is None:
+            continue
+
+        for line in lines:
+            angle = calc_angle(line[0])
+            if angle > 180/4 and angle < 90:
+                angles_up.append(angle)
+            if angle >= 90 and angle < 180 * (3/4):
+                angles_down.append(angle)
+
+    rotate_angle = 0
+    if len(angles_up) > 0.8 * len(angles_down):
+        rotate_angle = np.mean(angles_up)
+    elif len(angles_down) > 0.8 * len(angles_up):
+        rotate_angle = np.mean(angles_down)
+    else:
+        rotate_angle = np.mean(
+            np.append(
+                np.array(angles_up),
+                np.array(angles_down)
+            )
+        )
+
+    rotate_angle = rotate_angle - 90
+    if math.fabs(rotate_angle) > 2:
+        image = scipy.ndimage.rotate(image, rotate_angle)
+
+    best_angle = find_best_angle(image)
+    image = scipy.ndimage.rotate(image, best_angle)
+    cv2.imwrite('rotated.jpg', image)
+
+    return image
+
+def is_within(rect1, rect2):
+    """returns True if rect1 is completely within rect2
+    """
+    is_left_side = True
+    for pt in rect1:
+        xp , yp = pt
+        yp = -yp
+        for i in range(4):
+            x2, y2 = rect2[i]
+            y2 = -y2
+            x1, y1 = rect2[i + 1 if i + 1 < 4 else 0]
+            y1 = -y1
+            A = -(y2 - y1)
+            B = x2 - x1
+            C = -(A * x1 + B * y1)
+            is_left_side = is_left_side and (A * xp + B * yp + C) >= 0
+
+    return is_left_side
 
 if __name__ == '__main__':
     image = None
-    img_name = './test/cropped/test19'
+    img_name = './test/cropped/test15'
     try:
         img_path = img_name + '.JPG'
         image = Image.open(img_path)
@@ -250,82 +321,52 @@ if __name__ == '__main__':
 
     with PyTessBaseAPI(psm=PSM.SINGLE_BLOCK, lang='eng') as api:
         api.SetImage(image)
-        width, height = image.size
+        original = np.array(image)
         binarised = np.array(api.GetThresholdedImage())
         binarised = cv2.bitwise_not(binarised)
 
-        cropped_height = width // 5
-        all_lines = np.array([[[0, 0, 0, 0]]])
-        start = 0
-        while start < height:
-            end = start + cropped_height
-            if end > height:
-                end = height
-            img_segment = binarised[start:end]
-            lines = cv2.HoughLinesP(
-                img_segment,
-                1,
-                np.pi/180,
-                100,
-                minLineLength=width//3,
-                maxLineGap=width//20
-            )
+        edges = cv2.Canny(binarised,50,150)
+        plt.imshow(edges,cmap = 'gray')
+        plt.xticks([]), plt.yticks([])
+        plt.savefig('canny.jpg')
 
-            if lines is not None:
-                lines += np.array([[0, start, 0, start]])
-                all_lines = np.append(all_lines, lines, axis=0)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(10,3))
+        dilation = cv2.dilate(edges,kernel,iterations = 8)
 
-            start = end
+        plt.imshow(dilation,cmap = 'gray')
+        plt.xticks([]), plt.yticks([])
+        plt.savefig('dilate.jpg')
 
-        # for line in all_lines:
-        #     x1,y1,x2,y2 = line[0]
-        #     cv2.line(binarised,(x1,y1),(x2,y2),(255,0,0),2)
+        (img, cnts, __) = cv2.findContours(dilation,cv2.RETR_TREE,cv2.CHAIN_APPROX_SIMPLE)
 
-        # cv2.imwrite('lines.jpg', binarised)
+        cnt_boxes = [np.int0(
+                        cv2.boxPoints(
+                            cv2.minAreaRect(cnt)
+                        )
+                    ) for cnt in cnts]
+        cnt_boxes.sort(key=cv2.contourArea, reverse=True)
 
-        angles_up = []
-        angles_down = []
-        for line in all_lines:
-            angle = calc_angle(line[0])
-            if angle > 180/4 and angle < 90:
-                angles_up.append(angle)
-            if angle >= 90 and angle < 180 * (3/4):
-                angles_down.append(angle)
+        superset_boxes = [cnt_boxes[0]]
+        for i in range(1, len(cnt_boxes)):
+            box1 = cnt_boxes[i]
+            box1_is_within = False
+            for box2 in superset_boxes:
+                if is_within(box1, box2):
+                    box1_is_within = True
+                    break
+            if not box1_is_within:
+                superset_boxes.append(box1)
 
-        rotate_angle = 0
-        if len(angles_up) > 0.8 * len(angles_down):
-            rotate_angle = np.mean(angles_up)
-        elif len(angles_down) > 0.8 * len(angles_up):
-            rotate_angle = np.mean(angles_down)
-        else:
-            rotate_angle = np.mean(
-                np.append(
-                    np.array(angles_up),
-                    np.array(angles_down)
-                )
-            )
+        for box in superset_boxes:
+            cv2.drawContours(original,[box],0,(0,255,0),5)
+        cv2.imwrite('contours.jpg', original)
 
-        rotate_angle = rotate_angle - 90
-        if math.fabs(rotate_angle) > 2:
-            binarised = scipy.ndimage.rotate(binarised, rotate_angle)
+        raise Exception()
 
-        best_angle = find_best_angle(binarised)
-        binarised = scipy.ndimage.rotate(binarised, best_angle)
-        cv2.imwrite('rotated.jpg', binarised)
+        binarised = deskew_image(binarised)
 
         binarised = cv2.bitwise_not(binarised)
 
-        # print(rotate_angle - 90)
-        # image = image.rotate(rotate_angle - 90)
-        # api.SetImage(image)
-
-        # names_coord, prices_coord = split_image(api.GetThresholdedImage())
-        # names_img = image.crop((names_coord[0], 0, names_coord[1], height - 1))
-        # prices_img = image.crop((prices_coord[0], 0, prices_coord[1], height - 1))
-
-        # api.SetPageSegMode(PSM.SINGLE_LINE)
-        # api.SetImage(names_img)
-        
         image = Image.fromarray(binarised)
         api.SetImage(image)
         image = api.GetThresholdedImage()
