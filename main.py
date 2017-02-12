@@ -1,6 +1,5 @@
 from PIL import Image
 from tesserocr import PyTessBaseAPI, RIL, PSM, Orientation
-import tesserocr
 import time
 import numpy as np
 import cv2
@@ -79,7 +78,6 @@ def calc_angle(line):
 
 
 def find_best_angle(image):
-    return 0
     best_angle = 0
     max_variance = 0
     fig_num = 0
@@ -155,17 +153,30 @@ def deskew_image(text_area):
             )
         )
 
+    rotated = 0
     rotate_angle = rotate_angle - 90
-    print(rotate_angle)
     if math.fabs(rotate_angle) > 2:
         image = scipy.ndimage.rotate(image, rotate_angle)
+        rotated += rotate_angle
+
+        ih, iw = image.shape
+        x = x - (iw - width) / 2
+        y = y - (ih - height) / 2
+        height = ih
+        width = iw
 
     best_angle = find_best_angle(image)
-    print(best_angle)
     image = scipy.ndimage.rotate(image, best_angle)
+    rotated += best_angle
     cv2.imwrite('rotated.jpg', image)
 
-    return image
+    ih, iw = image.shape
+    x = x - (iw - width) / 2
+    y = y - (ih - height) / 2
+    height = ih
+    width = iw
+
+    return (image, np.int0(x), np.int0(y), rotated)
 
 
 def rotate_point(p, rotation, origin=(0, 0)):
@@ -243,7 +254,7 @@ def extract_text_areas(image):
     for box in superset_boxes:
         x, y, w, h = cv2.boundingRect(box[1])
 
-        if w < 100 or h < 100:
+        if w < 50 or h < 50:
             continue
 
         if x < 0:
@@ -286,22 +297,39 @@ if __name__ == '__main__':
 
         for i, text_area in enumerate(text_areas):
             if text_area[0].size == 0:
-                print('INVALIDDDDDDD')
                 continue
 
-            text = deskew_image(text_area)
+            text, tx, ty, angle = deskew_image(text_area)
             image = cv2.bitwise_not(text)
 
             image = Image.fromarray(image)
             api.SetImage(image)
             boxes = api.GetComponentImages(RIL.TEXTLINE, True)
             for im, box, __, __ in boxes:
-                api.SetRectangle(box['x'], box['y'], box['w'], box['h'])
+                x = box['x']
+                y = box['y']
+                w = box['w']
+                h = box['h']
+
+                api.SetRectangle(x, y, w, h)
                 ocrResult = api.GetUTF8Text()
                 conf = api.MeanTextConf()
                 print(ocrResult)
 
-            draw_boxes(
-                boxes, image, file_name='output{}.jpg'.format(i), color=0)
+                iw, ih = image.size
+                origin = (iw / 2, ih / 2)
+
+                detected_area = np.array([
+                    rotate_point((x, y), angle, origin=origin),
+                    rotate_point((x, y + h), angle, origin=origin),
+                    rotate_point((x + w, y + h), angle, origin=origin),
+                    rotate_point((x + w, y), angle, origin=origin),
+                ])
+
+                detected_area = np.add(detected_area, np.array([tx, ty]))
+
+                cv2.drawContours(original, [detected_area], 0, (0, 255, 0), 5)
+
+        cv2.imwrite('result.jpg', original)
 
     print('end')
