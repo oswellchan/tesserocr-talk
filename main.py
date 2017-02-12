@@ -1,7 +1,7 @@
 from PIL import Image
 from tesserocr import PyTessBaseAPI, RIL, PSM, Orientation
+import tesserocr
 import time
-import copy
 import numpy as np
 import cv2
 import math
@@ -11,25 +11,6 @@ import matplotlib.pyplot as plt
 THRESHOLD_WHITE = 200
 WEIGHT = 5
 
-class ImagePixels:
-    """docstring for ImagePixels"""
-    def __init__(self, image):
-        self.width, self.height = image.size
-        self.pixels = list(image.getdata())
-        self.mode = copy.copy(image.mode)
-
-    def __getitem__(self, coords):
-        x, y = coords
-        return self.pixels[x + y * self.width]
-
-    def __setitem__(self, coords, value):
-        x, y = coords
-        self.pixels[x + y * self.width] = value
-
-    def save_image(self, file_name):
-        img = Image.new(self.mode, (self.width, self.height))
-        img.putdata(self.pixels)
-        img.save(file_name)
 
 def measure_timing(func):
     def wrapper(*args, **kwargs):
@@ -38,6 +19,7 @@ def measure_timing(func):
         print(time.time() - start)
         return result
     return wrapper
+
 
 @measure_timing
 def draw_boxes(boxes, image, file_name='output.jpg', color=(255, 0, 0)):
@@ -53,106 +35,13 @@ def draw_boxes(boxes, image, file_name='output.jpg', color=(255, 0, 0)):
         for i in range(w):
             pix[x + i, y] = color
             pix[x + i, y + h - 1] = color
-        
+
         for i in range(h):
             pix[x, y + i] = color
             pix[x + w - 1, y + i] = color
 
     img.save(file_name)
 
-def draw_bw_box(boxes, image, file_name='output.jpg', color=0):
-    img = image.copy()
-    pix = img.load()
-
-    width, height = img.size
-    for box in boxes:
-        x = int(box['x'])
-        y = int(box['y'])
-        w = int(box['w'])
-        h = int(box['h'])
-
-        for i in range(w):
-            pix[x + i, y] = color
-            pix[x + i, y + h - 1] = color
-        
-        for i in range(h):
-            pix[x, y + i] = color
-            pix[x + w - 1, y + i] = color
-
-    img.save(file_name)
-
-def draw_hort_lines(lines, image, file_name='output.jpg'):
-    img = image.copy()
-    pix = img.load()
-    width, __ = image.size
-    for upper, lower in lines:
-        for i in range(width):
-            pix[i, upper] = (255, 0, 0)
-            pix[i, lower] = (255, 0, 0)
-
-    img.save(file_name)
-
-def draw_vert_lines(lines, image, file_name='output.jpg', color=(255, 0, 0)):
-    img = image.copy()
-    pix = img.load()
-    __, height = image.size
-    for left, right in lines:
-        for i in range(height):
-            pix[left, i] = color
-            pix[right, i] = color
-
-    img.save(file_name)
-    print('done')
-
-@measure_timing
-def split_image(image, threshold=THRESHOLD_WHITE, col_threshold_factor=0.1):
-    width, height = image.size
-    pix = image.load()
-
-    whitespaces = []
-    max_ws_index = 0
-    max_whitespace = 0
-    last_black = width - 1
-    for x in range(width - 1, 5*width//8, -1):
-        column = 0
-        for y in range(height):
-            if pix[x, y] < threshold:
-                column += 1
-
-        if (column < height * col_threshold_factor and
-                x > 5*width//8 + 1):
-            continue
-        
-        whitespace_len = last_black - x
-        whitespaces.append((x, last_black))
-        last_black = x
-
-        if whitespace_len > max_whitespace:
-            max_ws_index = len(whitespaces) - 1
-            max_whitespace = whitespace_len
-
-    max_start, max_end = whitespaces[max_ws_index]
-    left_padding = 0
-    if max_ws_index < len(whitespaces) - 1:
-        __, end = whitespaces[max_ws_index + 1]
-        separation = max_start - end
-        if separation > 0.05 * width:
-            left_padding = 0.05 * width
-        else:
-            left_padding = 0.7 * separation
-
-    right_padding = 0
-    if max_ws_index > 0:
-        start, __ = whitespaces[max_ws_index - 1]
-        separation = start - max_end
-        if separation > 0.05 * width:
-            right_padding = 0.05 * width
-        else:
-            right_padding = 0.7 * separation
-
-    #draw_vert_lines(whitespaces, image, file_name='output1.jpg', color=0)
-
-    return (0, max_start - left_padding), (max_end + right_padding , width - 1)
 
 def rotate_to_upright(image, api):
     api.SetPageSegMode(PSM.OSD_ONLY)
@@ -169,47 +58,28 @@ def rotate_to_upright(image, api):
         if os['orientation'] == Orientation.PAGE_DOWN:
             image = image.rotate(180, expand=True)
 
-    remove_black_border(image)
-
     return image
 
-def remove_black_border(image):
-    pass
-
-def get_weighted_img(image, radius):
-    w, h = image.size
-    pix = image.load()
-
-    return [[get_weight(x, y, w, h, radius, pix) for x in range(w)] for y in range(h)]
-            
-
-def get_weight(x, y, w, h, radius, pix):
-    if pix[x, y] > THRESHOLD_WHITE:
-        return 0
-
-    result = 1
-    for i in range(x - radius, x + radius):
-       for j in range(y - radius, y + radius):
-            if (0 <= i and i < w
-                    and 0 <= j and j < h):
-                result += WEIGHT  # maybe do exponential
-
-    return result
 
 def unit_vector(vector):
     if np.linalg.norm(vector) == 0:
         return None
     return vector / np.linalg.norm(vector)
 
+
 def calc_angle(line):
     x1, y1, x2, y2 = line
-    v1 = unit_vector(np.array([x1 - x2, y1 - y2]))
+    y1 = -y1
+    y2 = -y2
+    v1 = unit_vector(np.array([x2 - x1, y2 - y1]))
     v2 = np.array([0, 1])
     if v1 is None:
         return 0
-    return np.arccos(np.clip(np.dot(v1, v2), -1.0, 1.0))/np.pi * 180
+    return np.arccos(np.clip(np.dot(v1, v2), -1.0, 1.0)) / np.pi * 180
+
 
 def find_best_angle(image):
+    return 0
     best_angle = 0
     max_variance = 0
     fig_num = 0
@@ -232,7 +102,13 @@ def find_best_angle(image):
 
     return best_angle
 
-def deskew_image(image):
+
+def deskew_image(text_area):
+    image, x, y, box = text_area
+
+    if image.size == 0:
+        return image
+
     height, width = image.shape
     cropped_height = width // 5
 
@@ -247,10 +123,10 @@ def deskew_image(image):
         lines = cv2.HoughLinesP(
             img_segment,
             1,
-            np.pi/180,
+            np.pi / 180,
             100,
-            minLineLength=width//3,
-            maxLineGap=width//30
+            minLineLength=width // 3,
+            maxLineGap=width // 30
         )
         start = end
 
@@ -259,9 +135,9 @@ def deskew_image(image):
 
         for line in lines:
             angle = calc_angle(line[0])
-            if angle > 180/4 and angle < 90:
+            if angle > 180 / 4 and angle < 90:
                 angles_up.append(angle)
-            if angle >= 90 and angle < 180 * (3/4):
+            if angle >= 90 and angle < 180 * (3 / 4):
                 angles_down.append(angle)
 
     rotate_angle = 0
@@ -269,6 +145,8 @@ def deskew_image(image):
         rotate_angle = np.mean(angles_up)
     elif len(angles_down) > 0.8 * len(angles_up):
         rotate_angle = np.mean(angles_down)
+    elif len(angles_up) == 0 and len(angles_down) == 0:
+        rotate_angle = 90
     else:
         rotate_angle = np.mean(
             np.append(
@@ -278,21 +156,37 @@ def deskew_image(image):
         )
 
     rotate_angle = rotate_angle - 90
+    print(rotate_angle)
     if math.fabs(rotate_angle) > 2:
         image = scipy.ndimage.rotate(image, rotate_angle)
 
     best_angle = find_best_angle(image)
+    print(best_angle)
     image = scipy.ndimage.rotate(image, best_angle)
     cv2.imwrite('rotated.jpg', image)
 
     return image
+
+
+def rotate_point(p, rotation, origin=(0, 0)):
+    px, py = p
+    ox, oy = origin
+    rotation_in_rad = np.deg2rad(rotation)
+    rotated_x = np.cos(rotation_in_rad) * (px - ox) -   \
+        np.sin(rotation_in_rad) * (py - oy) + ox
+    rotated_y = np.sin(rotation_in_rad) * (px - ox) +   \
+        np.cos(rotation_in_rad) * (py - oy) + oy
+
+    return np.array([np.int0(np.round(rotated_x)),
+                     np.int0(np.round(rotated_y))])
+
 
 def is_within(rect1, rect2):
     """returns True if rect1 is completely within rect2
     """
     is_left_side = True
     for pt in rect1:
-        xp , yp = pt
+        xp, yp = pt
         yp = -yp
         for i in range(4):
             x2, y2 = rect2[i]
@@ -305,6 +199,69 @@ def is_within(rect1, rect2):
             is_left_side = is_left_side and (A * xp + B * yp + C) >= 0
 
     return is_left_side
+
+
+def extract_text_areas(image):
+    edges = cv2.Canny(image, 50, 150)
+    plt.imshow(edges, cmap='gray')
+    plt.xticks([]), plt.yticks([])
+    plt.savefig('canny.jpg')
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 3))
+    dilation = cv2.dilate(edges, kernel, iterations=8)
+
+    plt.imshow(dilation, cmap='gray')
+    plt.xticks([]), plt.yticks([])
+    plt.savefig('dilate.jpg')
+
+    img, cnts, __ = cv2.findContours(
+        dilation,
+        cv2.RETR_TREE,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    cnt_boxes = [(cnt, np.int0(cv2.boxPoints(cv2.minAreaRect(cnt))))
+                 for cnt in cnts]
+    cnt_boxes.sort(key=lambda x: cv2.contourArea(x[1]), reverse=True)
+
+    superset_boxes = [cnt_boxes[0]]
+    for i in range(1, len(cnt_boxes)):
+        box_tuple1 = cnt_boxes[i]
+        box1_is_within = False
+        for box_tuple2 in superset_boxes:
+            if is_within(box_tuple1[1], box_tuple2[1]):
+                box1_is_within = True
+                break
+        if not box1_is_within:
+            superset_boxes.append(box_tuple1)
+
+    # for box in superset_boxes:
+    #     cv2.drawContours(original,[box[1]],0,(0,255,0),5)
+    # cv2.imwrite('contours.jpg', image)
+
+    text_areas = []
+    for box in superset_boxes:
+        x, y, w, h = cv2.boundingRect(box[1])
+
+        if w < 100 or h < 100:
+            continue
+
+        if x < 0:
+            x = 0
+        if y < 0:
+            y = 0
+        mask = np.zeros_like(image)
+        cv2.drawContours(mask, [box[0]], 0, 255, -1)
+        masked_image = cv2.bitwise_and(image, mask)
+        text_areas.append(
+            (masked_image[y: y + h, x: x + w], x, y, box[1])
+        )
+
+    for i, text in enumerate(text_areas):
+        cv2.imwrite('contours{}.jpg'.format(i), text[0])
+
+    return text_areas
+
 
 if __name__ == '__main__':
     image = None
@@ -325,58 +282,26 @@ if __name__ == '__main__':
         binarised = np.array(api.GetThresholdedImage())
         binarised = cv2.bitwise_not(binarised)
 
-        edges = cv2.Canny(binarised,50,150)
-        plt.imshow(edges,cmap = 'gray')
-        plt.xticks([]), plt.yticks([])
-        plt.savefig('canny.jpg')
+        text_areas = extract_text_areas(binarised)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(10,3))
-        dilation = cv2.dilate(edges,kernel,iterations = 8)
+        for i, text_area in enumerate(text_areas):
+            if text_area[0].size == 0:
+                print('INVALIDDDDDDD')
+                continue
 
-        plt.imshow(dilation,cmap = 'gray')
-        plt.xticks([]), plt.yticks([])
-        plt.savefig('dilate.jpg')
+            text = deskew_image(text_area)
+            image = cv2.bitwise_not(text)
 
-        (img, cnts, __) = cv2.findContours(dilation,cv2.RETR_TREE,cv2.CHAIN_APPROX_SIMPLE)
+            image = Image.fromarray(image)
+            api.SetImage(image)
+            boxes = api.GetComponentImages(RIL.TEXTLINE, True)
+            for im, box, __, __ in boxes:
+                api.SetRectangle(box['x'], box['y'], box['w'], box['h'])
+                ocrResult = api.GetUTF8Text()
+                conf = api.MeanTextConf()
+                print(ocrResult)
 
-        cnt_boxes = [np.int0(
-                        cv2.boxPoints(
-                            cv2.minAreaRect(cnt)
-                        )
-                    ) for cnt in cnts]
-        cnt_boxes.sort(key=cv2.contourArea, reverse=True)
+            draw_boxes(
+                boxes, image, file_name='output{}.jpg'.format(i), color=0)
 
-        superset_boxes = [cnt_boxes[0]]
-        for i in range(1, len(cnt_boxes)):
-            box1 = cnt_boxes[i]
-            box1_is_within = False
-            for box2 in superset_boxes:
-                if is_within(box1, box2):
-                    box1_is_within = True
-                    break
-            if not box1_is_within:
-                superset_boxes.append(box1)
-
-        for box in superset_boxes:
-            cv2.drawContours(original,[box],0,(0,255,0),5)
-        cv2.imwrite('contours.jpg', original)
-
-        raise Exception()
-
-        binarised = deskew_image(binarised)
-
-        binarised = cv2.bitwise_not(binarised)
-
-        image = Image.fromarray(binarised)
-        api.SetImage(image)
-        image = api.GetThresholdedImage()
-        image.save('bina.jpg')
-        boxes = api.GetComponentImages(RIL.TEXTLINE, True)
-
-        for im, box, __, __ in boxes:
-            api.SetRectangle(box['x'], box['y'], box['w'], box['h'])
-            ocrResult = api.GetUTF8Text()
-            conf = api.MeanTextConf()
-            print(ocrResult)
-        
-        draw_boxes(boxes, image, color=0)
+    print('end')
