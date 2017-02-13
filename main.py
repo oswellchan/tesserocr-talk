@@ -6,6 +6,7 @@ import cv2
 import math
 import scipy.ndimage
 import matplotlib.pyplot as plt
+import threading
 
 THRESHOLD_WHITE = 200
 WEIGHT = 5
@@ -15,7 +16,7 @@ def measure_timing(func):
     def wrapper(*args, **kwargs):
         start = time.time()
         result = func(*args, **kwargs)
-        print(time.time() - start)
+        print('time: ', time.time() - start)
         return result
     return wrapper
 
@@ -77,28 +78,51 @@ def calc_angle(line):
     return np.arccos(np.clip(np.dot(v1, v2), -1.0, 1.0)) / np.pi * 180
 
 
+@measure_timing
 def find_best_angle(image):
     best_angle = 0
     max_variance = 0
-    fig_num = 0
-    count = 0
+
     for angle in np.linspace(-2.0, 2.0, num=32):
-        fig_num += 1
-        plt.subplot(2, 3, fig_num)
         rotated = scipy.ndimage.rotate(image, angle)
         variance = np.var(np.sum(rotated, axis=1))
-        plt.imshow(rotated)
-        plt.title(variance)
-        if fig_num == 6:
-            fig_num = 0
-            count += 1
-            plt.savefig('all_angles{}.jpg'.format(count))
 
         if variance > max_variance:
             best_angle = angle
             max_variance = variance
 
     return best_angle
+
+
+@measure_timing
+def find_best_angle_threaded(image):
+    variances = []
+    threads = []
+
+    for angle in np.linspace(-2.0, 2.0, num=32):
+        thread = threading.Thread(
+            target=cal_img_variance,
+            args=(image, angle, variances)
+        )
+        thread.start()
+        threads.append(thread)
+
+    for thread in threads:
+        thread.join()
+
+    best_angle = 0
+    max_variance = 0
+    for angle, variance in variances:
+        if variance > max_variance:
+            max_variance = variance
+            best_angle = angle
+
+    return best_angle
+
+
+def cal_img_variance(image, angle, variances):
+    rotated = scipy.ndimage.rotate(image, angle)
+    variances.append((angle, np.var(np.sum(rotated, axis=1))))
 
 
 def deskew_image(text_area):
@@ -165,7 +189,13 @@ def deskew_image(text_area):
         height = ih
         width = iw
 
+    print('--------thread----------')
+    best_angle = find_best_angle_threaded(image)
+    print('angle: ', best_angle)
+    print('--------seq----------')
     best_angle = find_best_angle(image)
+    print('angle: ', best_angle)
+
     image = scipy.ndimage.rotate(image, best_angle)
     rotated += best_angle
     cv2.imwrite('rotated.jpg', image)
