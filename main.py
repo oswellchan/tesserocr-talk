@@ -7,6 +7,7 @@ import math
 import scipy.ndimage
 import matplotlib.pyplot as plt
 import threading
+from multiprocessing import Process, Queue
 
 THRESHOLD_WHITE = 200
 WEIGHT = 5
@@ -192,9 +193,9 @@ def deskew_image(text_area):
     print('--------thread----------')
     best_angle = find_best_angle_threaded(image)
     print('angle: ', best_angle)
-    print('--------seq----------')
-    best_angle = find_best_angle(image)
-    print('angle: ', best_angle)
+    # print('--------seq----------')
+    # best_angle = find_best_angle(image)
+    # print('angle: ', best_angle)
 
     image = scipy.ndimage.rotate(image, best_angle)
     rotated += best_angle
@@ -242,7 +243,7 @@ def is_within(rect1, rect2):
     return is_left_side
 
 
-def extract_text_areas(image):
+def extract_text_areas(image, original):
     edges = cv2.Canny(image, 50, 150)
     plt.imshow(edges, cmap='gray')
     plt.xticks([]), plt.yticks([])
@@ -276,9 +277,10 @@ def extract_text_areas(image):
         if not box1_is_within:
             superset_boxes.append(box_tuple1)
 
-    # for box in superset_boxes:
-    #     cv2.drawContours(original,[box[1]],0,(0,255,0),5)
-    # cv2.imwrite('contours.jpg', image)
+    copy = original.copy()
+    for box in superset_boxes:
+        cv2.drawContours(copy, [box[1]], 0, (0, 255, 0), 5)
+    cv2.imwrite('contours.jpg', copy)
 
     text_areas = []
     for box in superset_boxes:
@@ -291,17 +293,79 @@ def extract_text_areas(image):
             x = 0
         if y < 0:
             y = 0
-        mask = np.zeros_like(image)
-        cv2.drawContours(mask, [box[0]], 0, 255, -1)
-        masked_image = cv2.bitwise_and(image, mask)
-        text_areas.append(
-            (masked_image[y: y + h, x: x + w], x, y, box[1])
-        )
+        crop = binarise_image_otsu(original[y: y + h, x: x + w])
+        mask = np.zeros_like(crop)
+        contours = np.add(box[0], np.array([-x, -y]))
+        cv2.drawContours(mask, [contours], 0, 255, -1)
+        masked_image = cv2.bitwise_and(crop, mask)
+        text_areas.append((masked_image, x, y, box[1]))
 
     for i, text in enumerate(text_areas):
         cv2.imwrite('contours{}.jpg'.format(i), text[0])
 
     return text_areas
+
+
+def binarise_image(image):
+    image = gray_and_blur(image)
+    image = cv2.adaptiveThreshold(image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 13, 2)
+    image = cv2.bitwise_not(image)
+    kernel = np.ones((5, 5), np.uint8)
+    image = cv2.erode(image, kernel, iterations=1)
+    image = cv2.dilate(image, kernel, iterations=1)
+    cv2.imwrite('bin.jpg', image)
+
+    return image
+
+
+def binarise_image_otsu(image):
+    image = gray_and_blur(image)
+    __, img = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    return cv2.bitwise_not(img)
+
+
+def gray_and_blur(image):
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    image = cv2.GaussianBlur(image, (5, 5), 0)
+
+    return image
+
+
+def evaluate_text_area(text_area, results):
+    if text_area[0].size == 0:
+        return
+
+    text, tx, ty, angle = deskew_image(text_area)
+    image = cv2.bitwise_not(text)
+
+    image = Image.fromarray(image)
+
+    with PyTessBaseAPI(psm=PSM.SINGLE_BLOCK, lang='eng') as api:
+        api.SetImage(image)
+        boxes = api.GetComponentImages(RIL.TEXTLINE, True)
+        for im, box, __, __ in boxes:
+            x = box['x']
+            y = box['y']
+            w = box['w']
+            h = box['h']
+
+            api.SetRectangle(x, y, w, h)
+            ocrResult = api.GetUTF8Text()
+
+            iw, ih = image.size
+            origin = (iw / 2, ih / 2)
+
+            detected_area = np.array([
+                rotate_point((x, y), angle, origin=origin),
+                rotate_point((x, y + h), angle, origin=origin),
+                rotate_point((x + w, y + h), angle, origin=origin),
+                rotate_point((x + w, y), angle, origin=origin),
+            ])
+
+            detected_area = np.add(detected_area, np.array([tx, ty]))
+            result = (ocrResult, detected_area)
+            results.put(result)
 
 
 if __name__ == '__main__':
@@ -320,45 +384,31 @@ if __name__ == '__main__':
     with PyTessBaseAPI(psm=PSM.SINGLE_BLOCK, lang='eng') as api:
         api.SetImage(image)
         original = np.array(image)
-        binarised = np.array(api.GetThresholdedImage())
-        binarised = cv2.bitwise_not(binarised)
 
-        text_areas = extract_text_areas(binarised)
+        binarised = binarise_image(original)
+        # binarised = np.array(api.GetThresholdedImage())
+        # binarised = cv2.bitwise_not(binarised)
+        # cv2.imwrite('binarised.jpg', binarised)
 
-        for i, text_area in enumerate(text_areas):
-            if text_area[0].size == 0:
-                continue
+        text_areas = extract_text_areas(binarised, original)
 
-            text, tx, ty, angle = deskew_image(text_area)
-            image = cv2.bitwise_not(text)
+        results = Queue()
+        processes = []
+        for text_area in text_areas:
+            process = Process(
+                target=evaluate_text_area,
+                args=(text_area, results)
+            )
+            process.start()
+            processes.append(process)
 
-            image = Image.fromarray(image)
-            api.SetImage(image)
-            boxes = api.GetComponentImages(RIL.TEXTLINE, True)
-            for im, box, __, __ in boxes:
-                x = box['x']
-                y = box['y']
-                w = box['w']
-                h = box['h']
+        for process in processes:
+            process.join()
 
-                api.SetRectangle(x, y, w, h)
-                ocrResult = api.GetUTF8Text()
-                conf = api.MeanTextConf()
-                print(ocrResult)
-
-                iw, ih = image.size
-                origin = (iw / 2, ih / 2)
-
-                detected_area = np.array([
-                    rotate_point((x, y), angle, origin=origin),
-                    rotate_point((x, y + h), angle, origin=origin),
-                    rotate_point((x + w, y + h), angle, origin=origin),
-                    rotate_point((x + w, y), angle, origin=origin),
-                ])
-
-                detected_area = np.add(detected_area, np.array([tx, ty]))
-
-                cv2.drawContours(original, [detected_area], 0, (0, 255, 0), 5)
+        while not results.empty():
+            result = results.get()
+            print(result[0])
+            cv2.drawContours(original, [result[1]], 0, (0, 255, 0), 5)
 
         cv2.imwrite('result.jpg', original)
 
