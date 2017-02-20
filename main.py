@@ -1,11 +1,10 @@
-from PIL import Image
+from PIL import Image, ImageFont, ImageDraw
 from tesserocr import PyTessBaseAPI, RIL, PSM, Orientation
 import time
 import numpy as np
 import cv2
 import math
 import scipy.ndimage
-import matplotlib.pyplot as plt
 import threading
 from multiprocessing import Process, Queue
 
@@ -22,42 +21,20 @@ def measure_timing(func):
     return wrapper
 
 
-@measure_timing
-def draw_boxes(boxes, image, file_name='output.jpg', color=(255, 0, 0)):
-    img = image.copy()
-    pix = img.load()
-    width, height = img.size
-    for (_, box, _, _) in boxes:
-        x = int(box['x'])
-        y = int(box['y'])
-        w = int(box['w'])
-        h = int(box['h'])
+def rotate_to_upright(image):
+    with PyTessBaseAPI(psm=PSM.OSD_ONLY) as api:
+        api.SetImage(image)
 
-        for i in range(w):
-            pix[x + i, y] = color
-            pix[x + i, y + h - 1] = color
+        os = api.DetectOS()
+        if os:
+            if os['orientation'] == Orientation.PAGE_RIGHT:
+                image = image.rotate(90, expand=True)
 
-        for i in range(h):
-            pix[x, y + i] = color
-            pix[x + w - 1, y + i] = color
+            if os['orientation'] == Orientation.PAGE_LEFT:
+                image = image.rotate(270, expand=True)
 
-    img.save(file_name)
-
-
-def rotate_to_upright(image, api):
-    api.SetPageSegMode(PSM.OSD_ONLY)
-    api.SetImage(image)
-
-    os = api.DetectOS()
-    if os:
-        if os['orientation'] == Orientation.PAGE_RIGHT:
-            image = image.rotate(90, expand=True)
-
-        if os['orientation'] == Orientation.PAGE_LEFT:
-            image = image.rotate(270, expand=True)
-
-        if os['orientation'] == Orientation.PAGE_DOWN:
-            image = image.rotate(180, expand=True)
+            if os['orientation'] == Orientation.PAGE_DOWN:
+                image = image.rotate(180, expand=True)
 
     return image
 
@@ -127,7 +104,7 @@ def cal_img_variance(image, angle, variances):
 
 
 def deskew_image(text_area):
-    image, x, y, box = text_area
+    image, x, y = text_area
 
     if image.size == 0:
         return image
@@ -149,8 +126,9 @@ def deskew_image(text_area):
             np.pi / 180,
             100,
             minLineLength=width // 3,
-            maxLineGap=width // 30
+            maxLineGap=100
         )
+
         start = end
 
         if lines is None:
@@ -190,16 +168,10 @@ def deskew_image(text_area):
         height = ih
         width = iw
 
-    print('--------thread----------')
     best_angle = find_best_angle_threaded(image)
-    print('angle: ', best_angle)
-    # print('--------seq----------')
-    # best_angle = find_best_angle(image)
-    # print('angle: ', best_angle)
 
     image = scipy.ndimage.rotate(image, best_angle)
     rotated += best_angle
-    cv2.imwrite('rotated.jpg', image)
 
     ih, iw = image.shape
     x = x - (iw - width) / 2
@@ -223,38 +195,22 @@ def rotate_point(p, rotation, origin=(0, 0)):
                      np.int0(np.round(rotated_y))])
 
 
-def is_within(rect1, rect2):
-    """returns True if rect1 is completely within rect2
+def is_within(mask1, mask2):
+    """returns True if mask1 is completely within mask2
     """
-    is_left_side = True
-    for pt in rect1:
-        xp, yp = pt
-        yp = -yp
-        for i in range(4):
-            x2, y2 = rect2[i]
-            y2 = -y2
-            x1, y1 = rect2[i + 1 if i + 1 < 4 else 0]
-            y1 = -y1
-            A = -(y2 - y1)
-            B = x2 - x1
-            C = -(A * x1 + B * y1)
-            is_left_side = is_left_side and (A * xp + B * yp + C) >= 0
+    result = cv2.bitwise_and(mask1, mask2)
+    return np.array_equal(result, mask1)
 
-    return is_left_side
+
+def create_mask(shape, contour):
+    mask = np.zeros(shape, dtype=np.uint8)
+    cv2.drawContours(mask, [contour], 0, 255, -1)
+    return mask
 
 
 def extract_text_areas(image, original):
-    edges = cv2.Canny(image, 50, 150)
-    plt.imshow(edges, cmap='gray')
-    plt.xticks([]), plt.yticks([])
-    plt.savefig('canny.jpg')
-
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 3))
-    dilation = cv2.dilate(edges, kernel, iterations=8)
-
-    plt.imshow(dilation, cmap='gray')
-    plt.xticks([]), plt.yticks([])
-    plt.savefig('dilate.jpg')
+    dilation = cv2.dilate(image, kernel, iterations=8)
 
     img, cnts, __ = cv2.findContours(
         dilation,
@@ -262,29 +218,24 @@ def extract_text_areas(image, original):
         cv2.CHAIN_APPROX_SIMPLE
     )
 
-    cnt_boxes = [(cnt, np.int0(cv2.boxPoints(cv2.minAreaRect(cnt))))
+    cnt_areas = [(cnt, create_mask(image.shape, cnt))
                  for cnt in cnts]
-    cnt_boxes.sort(key=lambda x: cv2.contourArea(x[1]), reverse=True)
+    cnt_areas.sort(key=lambda x: cv2.contourArea(x[0]), reverse=True)
 
-    superset_boxes = [cnt_boxes[0]]
-    for i in range(1, len(cnt_boxes)):
-        box_tuple1 = cnt_boxes[i]
-        box1_is_within = False
-        for box_tuple2 in superset_boxes:
-            if is_within(box_tuple1[1], box_tuple2[1]):
-                box1_is_within = True
+    superset_areas = [cnt_areas[0]]
+    for i in range(1, len(cnt_areas)):
+        cnt_area = cnt_areas[i]
+        area1_is_within = False
+        for __, superset_mask in superset_areas:
+            if is_within(cnt_area[1], superset_mask):
+                area1_is_within = True
                 break
-        if not box1_is_within:
-            superset_boxes.append(box_tuple1)
-
-    copy = original.copy()
-    for box in superset_boxes:
-        cv2.drawContours(copy, [box[1]], 0, (0, 255, 0), 5)
-    cv2.imwrite('contours.jpg', copy)
+        if not area1_is_within:
+            superset_areas.append(cnt_area)
 
     text_areas = []
-    for box in superset_boxes:
-        x, y, w, h = cv2.boundingRect(box[1])
+    for cnt, mask in superset_areas:
+        x, y, w, h = cv2.boundingRect(cnt)
 
         if w < 50 or h < 50:
             continue
@@ -294,14 +245,8 @@ def extract_text_areas(image, original):
         if y < 0:
             y = 0
         crop = binarise_image_otsu(original[y: y + h, x: x + w])
-        mask = np.zeros_like(crop)
-        contours = np.add(box[0], np.array([-x, -y]))
-        cv2.drawContours(mask, [contours], 0, 255, -1)
-        masked_image = cv2.bitwise_and(crop, mask)
-        text_areas.append((masked_image, x, y, box[1]))
-
-    for i, text in enumerate(text_areas):
-        cv2.imwrite('contours{}.jpg'.format(i), text[0])
+        masked_image = cv2.bitwise_and(crop, mask[y: y + h, x: x + w])
+        text_areas.append((masked_image, x, y))
 
     return text_areas
 
@@ -313,7 +258,6 @@ def binarise_image(image):
     kernel = np.ones((5, 5), np.uint8)
     image = cv2.erode(image, kernel, iterations=1)
     image = cv2.dilate(image, kernel, iterations=1)
-    cv2.imwrite('bin.jpg', image)
 
     return image
 
@@ -370,7 +314,7 @@ def evaluate_text_area(text_area, results):
 
 if __name__ == '__main__':
     image = None
-    img_name = './test/cropped/test15'
+    img_name = './test/cropped/test9'
     try:
         img_path = img_name + '.JPG'
         image = Image.open(img_path)
@@ -378,17 +322,13 @@ if __name__ == '__main__':
         img_path = img_name + '.jpg'
         image = Image.open(img_path)
 
-    with PyTessBaseAPI() as api:
-        image = rotate_to_upright(image, api)
+    image = rotate_to_upright(image)
 
     with PyTessBaseAPI(psm=PSM.SINGLE_BLOCK, lang='eng') as api:
         api.SetImage(image)
         original = np.array(image)
 
         binarised = binarise_image(original)
-        # binarised = np.array(api.GetThresholdedImage())
-        # binarised = cv2.bitwise_not(binarised)
-        # cv2.imwrite('binarised.jpg', binarised)
 
         text_areas = extract_text_areas(binarised, original)
 
@@ -406,10 +346,12 @@ if __name__ == '__main__':
             process.join()
 
         while not results.empty():
-            result = results.get()
-            print(result[0])
-            cv2.drawContours(original, [result[1]], 0, (0, 255, 0), 5)
+            text, box = results.get()
+            draw = ImageDraw.Draw(image)
+            font = ImageFont.truetype('DejaVuSans-Bold.ttf', 32)
+            points = list(map(tuple, box))
+            points.append(tuple(box[0]))
+            draw.line(points, width=5, fill=(0, 255, 0))
+            draw.text(points[0], text, (255, 0, 0), font=font)
 
-        cv2.imwrite('result.jpg', original)
-
-    print('end')
+        image.save('result.jpg')
