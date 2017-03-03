@@ -7,6 +7,8 @@ import math
 import scipy.ndimage
 import threading
 from multiprocessing import Process, Queue
+import sys
+
 
 THRESHOLD_WHITE = 200
 WEIGHT = 5
@@ -313,15 +315,13 @@ def evaluate_text_area(text_area, results):
 
 
 if __name__ == '__main__':
-    image = None
-    img_name = './test/cropped/test9'
-    try:
-        img_path = img_name + '.JPG'
-        image = Image.open(img_path)
-    except Exception:
-        img_path = img_name + '.jpg'
-        image = Image.open(img_path)
+    if len(sys.argv) != 2:
+        print("Incorrect number of arguments '{}' given.".format(len(sys.argv) - 1))
+        print("Usage: python main.py <file_path>")
+        sys.exit()
 
+    img_path = sys.argv[1]
+    image = Image.open(img_path)
     image = rotate_to_upright(image)
 
     with PyTessBaseAPI(psm=PSM.SINGLE_BLOCK, lang='eng') as api:
